@@ -8,10 +8,15 @@ class DrivingPolicy(nn.Module):
         # 2D Conv layer to reduce channels
         self.reduce_channels = nn.Conv2d(1440, 3, 3, 1, 1)
 
-        # Linear layers to process reduced features
-        self.fc1 = nn.Linear(2328, 2328)
-        self.fc2 = nn.Linear(2328, 1164)
-        self.fc3 = nn.Linear(1164, 128)
+        # Temporal Memory (GRU)
+        # Input: 14 (compressed visual) + 4 (egomotion) = 18 features per step
+        self.temporal_gru = nn.GRU(input_size=18, hidden_size=512, batch_first=True)
+
+        # Linear layers to process current features + temporal memory
+        # 1176 (current vision) + 512 (GRU hidden state) = 1688
+        self.fc1 = nn.Linear(1688, 1688)
+        self.fc2 = nn.Linear(1688, 844)
+        self.fc3 = nn.Linear(844, 128)
 
         # Visual history compression layer
         self.compress_vision = nn.Linear(1176, 14)
@@ -23,15 +28,29 @@ class DrivingPolicy(nn.Module):
         self.activation = nn.GELU()
  
     def forward(self, fused_features, visual_history, egomotion_history):
-
-        # Reduce visual feature channels
+        # 1. Process Current Vision
+        # fused_features shape: (8, 1440, 7, 7) assuming batch 1
         feature_map = self.reduce_channels(fused_features)
-
-        # Flatten visual features and concatenate with
-        # visual scene history and egomotion history
-        visual_feature_vector = torch.flatten(feature_map)
-        feature_vector = torch.cat((visual_feature_vector, 
-                                    visual_history, egomotion_history), dim=0)
+        # Flatten and keep tiles in batch dimension or combine them
+        current_vision = torch.flatten(feature_map, start_dim=1) # (8, 147)
+        current_vision_vector = torch.flatten(current_vision) # (1176)
+        
+        # 2. Process Temporal Memory
+        # visual_history (896) -> (1, 64, 14)
+        # egomotion_history (256) -> (1, 64, 4)
+        v_hist = visual_history.view(1, 64, 14)
+        e_hist = egomotion_history.view(1, 64, 4)
+        
+        # Combine visual and egomotion sequences
+        temporal_sequence = torch.cat((v_hist, e_hist), dim=2) # (1, 64, 18)
+        
+        # Forward pass through GRU
+        # we only need the last hidden state
+        _, h_n = self.temporal_gru(temporal_sequence)
+        temporal_context = h_n.squeeze(0).squeeze(0) # (512)
+        
+        # 3. Concatenate Current and Temporal
+        feature_vector = torch.cat((current_vision_vector, temporal_context), dim=0)
         
         # Multi-layer perceptron
         f1 = self.fc1(feature_vector)
@@ -42,13 +61,10 @@ class DrivingPolicy(nn.Module):
         f2 = self.activation(f2)
         f2 = self.dropout(f2)
 
-        # Trajectory output - 64 x (acceleration & curvature) at
-        # 10Hz yielding a 6.4s future time horizon prediction
+        # Trajectory output
         trajectory = self.fc3(f2)
 
-        # Compressed visual feature vector of length 14 to form
-        # visual history
-        compressed_visual_feature_vector = \
-            self.compress_vision(visual_feature_vector)
+        # Compressed visual feature vector for future history
+        compressed_visual_feature_vector = self.compress_vision(current_vision_vector)
 
-        return trajectory, compressed_visual_feature_vector   
+        return trajectory, compressed_visual_feature_vector

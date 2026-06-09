@@ -6,7 +6,8 @@ class FeatureFusion(nn.Module):
         super(FeatureFusion, self).__init__()
 
         # Adaptive pooling to achieve 7x7 resolution
-        self.pool = nn.AdaptiveMaxPool2d(7)
+        # Use AvgPool instead of MaxPool for better ONNX/TRT compatibility
+        self.pool = nn.AdaptiveAvgPool2d(7)
  
     def forward(self, features):
 
