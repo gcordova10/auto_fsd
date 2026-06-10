@@ -1,0 +1,2 @@
+Acceleration Variance: 1.5780700550749316e-06
+Curvature Variance: 5.6507044376985505e-08

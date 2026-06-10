@@ -1,8 +1,10 @@
+import torch
 import torch.nn as nn
 from .backbone import Backbone
 from .feature_fusion import FeatureFusion
 from .driving_policy import DrivingPolicy
 from .future_state import FutureState
+from .causal_reasoning import CausalReasoningModule
 
 
 class AutoE2E(nn.Module):
@@ -21,6 +23,9 @@ class AutoE2E(nn.Module):
         # Future visual state prediction
         self.FutureState = FutureState(embed_dim=embed_dim)
 
+        # Causal reasoning (System 2)
+        self.CausalReasoning = CausalReasoningModule()
+
     def forward(self, x, visual_history, egomotion_history, camera_params=None, mode="train"):
         B, V, C, H, W = x.shape
 
@@ -34,9 +39,27 @@ class AutoE2E(nn.Module):
         driving_policy, compressed_visual_feature_vector = \
             self.DrivingPolicy(fused_features, visual_history, egomotion_history)
 
+        # Build feature vector for reasoning (System 2)
+        # Using the same flattened visual features as DrivingPolicy
+        with torch.no_grad():
+            feature_map = self.DrivingPolicy.reduce_channels(fused_features)
+            visual_feature_vector = torch.flatten(feature_map, start_dim=1)
+            feature_vector_reasoning = torch.cat((visual_feature_vector, 
+                                                 visual_history, egomotion_history), dim=1)
+
+        # System 2 Reasoning
+        reasoning_latent, decision_logits, text_logits = self.CausalReasoning(feature_vector_reasoning)
+
         if(mode == "train"):
             future_visual_features = self.FutureState(fused_features)
         else:
             future_visual_features = None
 
-        return driving_policy, compressed_visual_feature_vector, future_visual_features
+        return {
+            "trajectory": driving_policy,
+            "visual_context": compressed_visual_feature_vector,
+            "future_vision": future_visual_features,
+            "reasoning_latent": reasoning_latent,
+            "decision_logits": decision_logits,
+            "text_logits": text_logits
+        }
