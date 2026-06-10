@@ -51,7 +51,7 @@ class AutoE2E(nn.Module):
         reasoning_latent, decision_logits, text_logits = self.CausalReasoning(feature_vector_reasoning)
 
         if(mode == "train"):
-            future_visual_features = self.FutureState(fused_features)
+            future_visual_features = self.FutureState(fused_features, driving_policy)
         else:
             future_visual_features = None
 
