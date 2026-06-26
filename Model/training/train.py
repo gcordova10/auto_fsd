@@ -7,11 +7,18 @@ together three pieces that already exist and are unit-tested:
   - ``L2DDataset``               sequential L2D frames -> batched dict
   - ``TrajectoryImitationLoss``  smooth-L1 / MSE over the predicted waypoints
 
-Only the trajectory (imitation) loss is optimized. ``FutureState`` runs during
-``mode="train"`` but its output is not yet a training signal (see #13), so it is
-left OFF by default here to save memory and compute. Pass
-``--enable-future-state`` only to profile the worst-case memory of the full
-forward (e.g. BEV at full resolution); it does NOT add a loss term yet.
+By default only the trajectory (imitation) loss is optimized. With
+``--enable-world-model`` the **JEPA feature-reconstruction loss** (#13) is added
+as an auxiliary objective: ``total = trajectory_loss + lambda * jepa_loss``,
+computed over the 1 Hz past/future multi-view windows via the World Model's
+windowed API. The per-step JEPA value is also logged as ``prediction_error`` —
+the introspection / uncertainty signal proposed in #13. Real past/future
+windows come from the #16 data loader; until then ``--smoke-test`` feeds
+synthetic ones so the path is exercised end-to-end.
+
+(The legacy ``--enable-future-state`` flag only profiles the worst-case forward
+memory and does NOT add a loss term; the BEV ``FutureState`` was retired in the
+24/06 refactor.)
 
 The backbone, view-fusion mode, and BEV grid resolution are all constructor
 arguments. ``--backbone`` and ``--fusion-mode`` are validated against the
@@ -75,6 +82,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--enable-future-state", action="store_true",
                    help="Run FutureState during forward. Memory profiling only — "
                         "its output is not a loss term yet (see #13).")
+    p.add_argument("--enable-world-model", action="store_true",
+                   help="Enable the World Model (JEPA) branch and add its "
+                        "feature-reconstruction loss to the objective (#13).")
+    p.add_argument("--jepa-weight", type=float, default=1.0,
+                   help="Weight lambda for the JEPA loss vs the trajectory loss (#13).")
 
     # Optimization
     p.add_argument("--lr", type=float, default=1e-4)
@@ -145,6 +157,7 @@ def build_model(args: argparse.Namespace, device: torch.device) -> AutoE2E:
         view_fusion_kwargs=view_fusion_kwargs,
         num_timesteps=args.num_timesteps,
         num_signals=args.num_signals,
+        enable_world_model=args.enable_world_model,
     )
     return model.to(device)
 
@@ -182,14 +195,22 @@ def build_dataloader(args: argparse.Namespace) -> DataLoader:
 def make_smoke_batch(args: argparse.Namespace, device: torch.device) -> dict:
     """A batch of random tensors matching L2DDataset's collated shapes."""
     B, V = args.batch_size, args.num_views
-    return {
+    batch = {
         "visual_tiles": torch.randn(B, V, 3, 256, 256, device=device),
+        "map_input": torch.randn(B, 3, 256, 256, device=device),
         "visual_history": torch.randn(B, 896, device=device),
         "egomotion_history": torch.randn(B, 256, device=device),
         "trajectory_target": torch.randn(
             B, args.num_timesteps * args.num_signals, device=device
         ),
     }
+    if args.enable_world_model:
+        # 1 Hz multi-view past window + future targets for the JEPA loss.
+        # Synthetic here; the real streams come from the #16 data loader.
+        n = 4  # WorldActionModel default history_len / num_future_steps
+        batch["history_frames"] = torch.randn(B, n, V, 3, 256, 256, device=device)
+        batch["future_frames"] = torch.randn(B, n, V, 3, 256, 256, device=device)
+    return batch
 
 
 def move_batch(batch: dict, device: torch.device) -> dict:
@@ -197,6 +218,45 @@ def move_batch(batch: dict, device: torch.device) -> dict:
         k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
         for k, v in batch.items()
     }
+
+
+def compute_step_loss(model, batch, loss_fn, camera_params=None, jepa_weight=1.0):
+    """One training step's loss: trajectory imitation (+ optional JEPA, #13).
+
+    Post-refactor forward contract: ``AutoE2E(...)`` returns the trajectory
+    tensor (and, with the World Model on in train mode, ``(trajectory,
+    future_state_pred)``). The JEPA auxiliary loss is computed via the windowed
+    World Model API (``encode_history -> aggregate_history -> predict_future ->
+    jepa_loss``) over the 1 Hz past/future windows in the batch — independent of
+    the planner forward, so it's a clean auxiliary term.
+
+    Returns ``(total_loss, traj_loss_detached, prediction_error)`` where
+    ``prediction_error`` is the (detached) JEPA term used as the introspection /
+    uncertainty signal (``None`` when the World Model or future targets are absent).
+    """
+    out = model(
+        batch["visual_tiles"],
+        batch["map_input"],
+        batch["visual_history"],
+        batch["egomotion_history"],
+        camera_params=camera_params,
+        mode="train",
+        trajectory_target=batch["trajectory_target"],
+    )
+    trajectory = out[0] if isinstance(out, tuple) else out
+    traj_loss = loss_fn(trajectory, batch["trajectory_target"])
+
+    total = traj_loss
+    prediction_error = None
+    wam = getattr(model, "World_Action_Model_E2E", None)
+    if wam is not None and "history_frames" in batch and "future_frames" in batch:
+        visual_history = wam.aggregate_history(wam.encode_history(batch["history_frames"]))
+        future_pred = wam.predict_future(visual_history)
+        jepa = wam.jepa_loss(future_pred, batch["future_frames"])
+        total = traj_loss + jepa_weight * jepa
+        prediction_error = jepa.detach()  # introspection: future-feature prediction error
+
+    return total, traj_loss.detach(), prediction_error
 
 
 def run_training(args: argparse.Namespace) -> None:
@@ -286,12 +346,11 @@ def run_training(args: argparse.Namespace) -> None:
         num_signals=args.num_signals,
     ).to(device)
 
-    # mode="train" activates FutureState; any other value skips it (see AutoE2E).
-    forward_mode = "train" if args.enable_future_state else "eval"
-
-    # camera_params stays None: concat/cross_attn ignore it, and BEV falls back to
-    # its learnable pseudo_projection. Real L2D calibration is future work.
+    # camera_params stays None: BEV fusion falls back to its learnable
+    # pseudo_projection. Real L2D calibration is future work.
     camera_params = None
+    if args.enable_world_model:
+        print(f"World Model (JEPA) ON: lambda={args.jepa_weight}")
 
     batches: Iterable[Any]
     if args.smoke_test:
@@ -319,14 +378,10 @@ def run_training(args: argparse.Namespace) -> None:
 
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
                                 enabled=use_amp):
-                trajectory, _ego_hidden, _future = model(
-                    batch["visual_tiles"],
-                    batch["visual_history"],
-                    batch["egomotion_history"],
-                    camera_params=camera_params,
-                    mode=forward_mode,
+                loss, _traj_loss, prediction_error = compute_step_loss(
+                    model, batch, loss_fn,
+                    camera_params=camera_params, jepa_weight=args.jepa_weight,
                 )
-                loss = loss_fn(trajectory, batch["trajectory_target"])
 
             # bf16 has fp32 dynamic range, so no GradScaler is needed.
             loss.backward()
@@ -336,10 +391,16 @@ def run_training(args: argparse.Namespace) -> None:
 
             running += loss.item()
             n += 1
+            pred_err = None if prediction_error is None else prediction_error.item()
             if mlflow_active:
                 mlflow.log_metric("train_loss", loss.item(), step=epoch * 10000 + step)
+                if pred_err is not None:
+                    # introspection: future-feature prediction error (uncertainty signal, #13)
+                    mlflow.log_metric("world_model/prediction_error", pred_err,
+                                      step=epoch * 10000 + step)
             if step % args.log_interval == 0:
-                print(f"epoch {epoch} step {step} loss {loss.item():.4f}")
+                extra = "" if pred_err is None else f" | pred_err {pred_err:.4f}"
+                print(f"epoch {epoch} step {step} loss {loss.item():.4f}{extra}")
 
         dt = time.perf_counter() - t0
         msg = f"epoch {epoch} done | mean_loss {running / max(n, 1):.4f} | {dt:.1f}s"
