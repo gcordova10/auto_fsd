@@ -92,7 +92,10 @@ class MoondreamReasoningBranch(nn.Module):
         revision: checkpoint revision to pin.  Pinned by default because
             the loader uses ``trust_remote_code=True`` — an unpinned
             revision would execute whatever code the upstream repo's HEAD
-            ships at load time (supply-chain risk).
+            ships at load time (supply-chain risk).  Note the pinned
+            revision's remote code targets the transformers 4.5x API
+            (verified with 4.53.3); transformers 5.x renamed internals it
+            relies on (``all_tied_weights_keys``) and fails to load.
 
     Example (test/CI usage, no downloads)::
 
