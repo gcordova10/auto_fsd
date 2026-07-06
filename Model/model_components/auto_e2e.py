@@ -56,14 +56,40 @@ class AutoE2E(nn.Module):
         # the student/teacher loss, and feeds the trajectory planner through a
         # ZERO-INIT gate that modulates the visual history (#98/#103) — a
         # strict no-op at initialisation, so with the gate untrained the
-        # reactive baseline is unchanged.  Opt-in (default OFF) so the
-        # reactive-only baseline is byte-for-byte unchanged when disabled.
+        # reactive baseline is unchanged.  Two swappable backbones:
+        #   * "head_on_896" (default): trained heads on the Encoded Visual
+        #     History (current + 4 future horizons).
+        #   * "moondream_frozen": frozen Moondream2 tiny-VLM reading the front
+        #     camera directly (single horizon), independent from the World
+        #     Model.  Proposed in #98.
+        # Opt-in (default OFF) so the reactive-only baseline is byte-for-byte
+        # unchanged when disabled.
         self.Reasoning_Band: Optional[nn.Module] = None
+        self.reasoning_front_view: int = 0
         if enable_reasoning_band:
-            from .reasoning.reasoning_band import ReasoningBand  # local import — lazy
             rkw = dict(reasoning_kwargs or {})
+            backbone = rkw.pop("backbone", "head_on_896")
+            # Which camera view feeds a frame-reading backbone (L2D order).
+            self.reasoning_front_view = rkw.pop("front_view_index", 0)
+            if not 0 <= self.reasoning_front_view < num_views:
+                raise ValueError(
+                    f"front_view_index={self.reasoning_front_view} is out of "
+                    f"range for num_views={num_views}."
+                )
             rkw.setdefault("visual_history_dim", visual_history_dim)
-            self.Reasoning_Band = ReasoningBand(**rkw)
+            if backbone == "moondream_frozen":
+                from .reasoning.backbones.moondream_frozen import (  # local import — lazy
+                    MoondreamReasoningBranch,
+                )
+                self.Reasoning_Band = MoondreamReasoningBranch(**rkw)
+            elif backbone == "head_on_896":
+                from .reasoning.reasoning_band import ReasoningBand  # local import — lazy
+                self.Reasoning_Band = ReasoningBand(**rkw)
+            else:
+                raise ValueError(
+                    f"Unknown reasoning backbone '{backbone}'. "
+                    "Available: 'head_on_896' (default), 'moondream_frozen'."
+                )
 
     def reset_visual_history(self):
         """Clear the World Model's rolling buffer (call between sequences)."""
@@ -139,7 +165,11 @@ class AutoE2E(nn.Module):
         # only diverges as training moves the gate (#98/#103).
         reasoning_pred = None
         if self.Reasoning_Band is not None:
-            reasoning_pred = self.Reasoning_Band(visual_history, mode=mode)
+            reasoning_pred = self.Reasoning_Band(
+                visual_history,
+                mode=mode,
+                images=camera_tiles[:, self.reasoning_front_view],
+            )
             visual_history = reasoning_pred.modulated_visual_history
 
         trajectory = self.Reactive_E2E(camera_tiles, map_input, visual_history, egomotion_history,

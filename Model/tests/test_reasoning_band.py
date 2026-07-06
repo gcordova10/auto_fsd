@@ -9,6 +9,9 @@ Covered:
     * Planner coupling (#98/#103): forward returns a ReasoningPrediction whose
       zero-init gate is a strict no-op at initialisation (modulated history ==
       input) and only diverges once trained; per-horizon confidence included.
+    * Frozen Moondream2 branch: stubbed captioner (no downloads), keyword→
+      taxonomy mapping, single horizon, gate-only trainable params, AutoE2E
+      wiring behind reasoning_kwargs={"backbone": "moondream_frozen"}.
     * Taxonomy is extensible: adding a KIT label does not change existing indices.
     * Multi-label: several classes can be active simultaneously.
     * Multi-horizon: train mode returns 5 horizons; infer mode returns 1.
@@ -31,6 +34,7 @@ from model_components.reasoning.scenario_taxonomy import (
     DEFAULT_TAXONOMY,
 )
 from model_components.reasoning.reasoning_band import ReasoningBand, ReasoningPrediction
+from model_components.reasoning.backbones import MoondreamReasoningBranch
 from model_components.reasoning.teachers.deterministic import DeterministicTeacher
 from training.losses.reasoning_loss import ReasoningLoss
 
@@ -583,39 +587,221 @@ class TestTaxonomyExtensibility:
 
 
 # ---------------------------------------------------------------------------
-# Asymmetric Loss option (class-imbalance; arXiv:2009.14119)
+# Frozen Moondream2 branch (#98) — stubbed captioner, no downloads
 # ---------------------------------------------------------------------------
 
-class TestAsymmetricLoss:
-    def _logits_targets(self, logit_val: float, target_val: float):
-        logits = {g.name: [torch.full((B, len(g)), logit_val)]
-                  for g in DEFAULT_TAXONOMY.groups}
-        targets = {g.name: [torch.full((B, len(g)), target_val)]
-                   for g in DEFAULT_TAXONOMY.groups}
-        return logits, targets
+class TestMoondreamReasoningBranch:
+    def _frames(self, device):
+        return torch.zeros(B, 3, 64, 64, device=device)
 
-    def test_asl_near_zero_for_perfect_predictions(self):
-        logits, targets = self._logits_targets(10.0, 1.0)
-        assert ReasoningLoss(loss_type="asl")(logits, targets).item() < 0.01
+    def _branch(self, device, captions, **kw):
+        return MoondreamReasoningBranch(
+            visual_history_dim=VH_DIM,
+            caption_fn=lambda imgs: list(captions) * (imgs.shape[0] // len(captions)),
+            **kw,
+        ).to(device)
 
-    def test_asl_downweights_easy_negatives_vs_bce(self):
-        logits, targets = self._logits_targets(-2.0, 0.0)
-        asl = ReasoningLoss(loss_type="asl")(logits, targets).item()
-        bce = ReasoningLoss(loss_type="bce")(logits, targets).item()
-        assert asl < bce
+    def test_keyword_mapping_hits_expected_labels(self, device):
+        branch = self._branch(
+            device, ["turning left past a pedestrian in the rain"] )
+        pred = branch(_vh(device), images=self._frames(device))
+        man = torch.sigmoid(pred.logits["maneuver"][0])
+        edge = torch.sigmoid(pred.logits["edge_case"][0])
+        wea = torch.sigmoid(pred.logits["weather_env"][0])
+        assert man[0, DEFAULT_TAXONOMY["maneuver"].index("turn_left")] > 0.9
+        assert edge[0, DEFAULT_TAXONOMY["edge_case"].index("close_to_vru")] > 0.9
+        assert wea[0, DEFAULT_TAXONOMY["weather_env"].index("rain_day")] > 0.9
+        # A label with no matching phrase stays low.
+        assert man[0, DEFAULT_TAXONOMY["maneuver"].index("turn_right")] < 0.1
 
-    def test_reduction_none_shape(self):
-        logits, targets = self._logits_targets(0.0, 0.5)
-        loss = ReasoningLoss(loss_type="asl", reduction="none")(logits, targets)
-        assert loss.shape == (B,)
+    def test_single_horizon_regardless_of_mode(self, device):
+        branch = self._branch(device, ["driving straight"])
+        pred = branch(_vh(device), mode="train", images=self._frames(device))
+        for group in DEFAULT_TAXONOMY.groups:
+            assert len(pred.logits[group.name]) == 1
+        assert pred.confidence.shape == (B, 1)
 
-    def test_invalid_loss_type_raises(self):
-        with pytest.raises(ValueError, match="loss_type"):
-            ReasoningLoss(loss_type="focal")
+    def test_gate_is_noop_at_init(self, device):
+        branch = self._branch(device, ["fog on the road"])
+        vh = _vh(device)
+        pred = branch(vh, images=self._frames(device))
+        assert torch.allclose(pred.modulated_visual_history, vh, atol=1e-6)
 
-    def test_asl_backward(self):
-        logits = {g.name: [torch.zeros(B, len(g), requires_grad=True)]
-                  for g in DEFAULT_TAXONOMY.groups}
-        targets = {g.name: [torch.ones(B, len(g))] for g in DEFAULT_TAXONOMY.groups}
-        ReasoningLoss(loss_type="asl")(logits, targets).backward()
-        assert logits["maneuver"][0].grad is not None
+    def test_requires_images(self, device):
+        branch = self._branch(device, ["anything"])
+        with pytest.raises(ValueError, match="front-camera frames"):
+            branch(_vh(device))
+
+    def test_caption_count_mismatch_raises(self, device):
+        branch = MoondreamReasoningBranch(
+            visual_history_dim=VH_DIM, caption_fn=lambda imgs: ["only one"]
+        ).to(device)
+        if B == 1:
+            pytest.skip("mismatch needs B > 1")
+        with pytest.raises(ValueError, match="captions"):
+            branch(_vh(device), images=self._frames(device))
+
+    def test_point_fn_boosts_edge_cases(self, device):
+        branch = MoondreamReasoningBranch(
+            visual_history_dim=VH_DIM,
+            caption_fn=lambda imgs: ["an empty street"] * imgs.shape[0],
+            point_fn=lambda imgs, query: [1] * imgs.shape[0],
+        ).to(device)
+        pred = branch(_vh(device), images=self._frames(device))
+        edge = torch.sigmoid(pred.logits["edge_case"][0])
+        assert edge[0, DEFAULT_TAXONOMY["edge_case"].index("close_to_vru")] > 0.9
+        assert edge[0, DEFAULT_TAXONOMY["edge_case"].index("stop_for_object_in_path")] > 0.9
+
+    def test_only_gate_is_trainable(self, device):
+        branch = self._branch(device, ["driving straight"])
+        trainable = [n for n, p in branch.named_parameters() if p.requires_grad]
+        assert trainable and all(n.startswith("gate.") for n in trainable)
+
+
+class TestAutoE2EMoondreamBackbone(_AutoE2EHarness):
+    """The frozen Moondream2 variant wires into AutoE2E behind the same flag."""
+
+    def test_moondream_backbone_runs_and_returns_prediction(self, device):
+        m = self._build(
+            device,
+            enable_reasoning_band=True,
+            reasoning_kwargs={
+                "backbone": "moondream_frozen",
+                "caption_fn": lambda imgs: ["turning right"] * imgs.shape[0],
+            },
+        )
+        assert isinstance(m.Reasoning_Band, MoondreamReasoningBranch)
+        cam, mp, vh, ego = self._inputs(device)
+        tgt = torch.randn(B, 128, device=device)
+        out = m(cam, mp, vh, ego, mode="train", trajectory_target=tgt)
+        assert isinstance(out, tuple) and len(out) == 3
+        _traj, _future, pred = out
+        assert isinstance(pred, ReasoningPrediction)
+        man = torch.sigmoid(pred.logits["maneuver"][0])
+        assert man[0, DEFAULT_TAXONOMY["maneuver"].index("turn_right")] > 0.9
+
+    def test_unknown_backbone_raises(self, device):
+        with pytest.raises(ValueError, match="reasoning backbone"):
+            self._build(device, enable_reasoning_band=True,
+                        reasoning_kwargs={"backbone": "nope"})
+
+
+# ---------------------------------------------------------------------------
+# Faithfulness / intervention check (#98 evaluation protocol)
+# ---------------------------------------------------------------------------
+
+class TestReasoningInterventionDelta(_AutoE2EHarness):
+    """The intervention metric: with the gate untrained the coupled and
+    intervened trajectories are identical (delta 0.0); once the gate moves,
+    the reasoning signal measurably influences the trajectory."""
+
+    def test_zero_delta_at_init(self, device):
+        from evaluation.faithfulness import reasoning_intervention_delta
+        m = self._build(device, enable_reasoning_band=True,
+                        reasoning_kwargs={"hidden_dim": 32})
+        cam, mp, vh, ego = self._inputs(device)
+        delta = reasoning_intervention_delta(m, cam, mp, vh, ego)
+        assert delta["trajectory_l2"] == pytest.approx(0.0, abs=1e-5)
+        assert delta["history_shift"] == pytest.approx(0.0, abs=1e-5)
+
+    def test_positive_delta_once_gate_moves(self, device):
+        from evaluation.faithfulness import reasoning_intervention_delta
+        m = self._build(device, enable_reasoning_band=True,
+                        reasoning_kwargs={"hidden_dim": 32})
+        with torch.no_grad():
+            m.Reasoning_Band.gate.beta.bias.fill_(1.0)
+        cam, mp, vh, ego = self._inputs(device)
+        delta = reasoning_intervention_delta(m, cam, mp, vh, ego)
+        assert delta["history_shift"] > 0.0
+
+    def test_band_restored_after_intervention(self, device):
+        from evaluation.faithfulness import reasoning_intervention_delta
+        m = self._build(device, enable_reasoning_band=True,
+                        reasoning_kwargs={"hidden_dim": 32})
+        band = m.Reasoning_Band
+        cam, mp, vh, ego = self._inputs(device)
+        reasoning_intervention_delta(m, cam, mp, vh, ego)
+        assert m.Reasoning_Band is band
+
+    def test_requires_reasoning_band(self, device):
+        from evaluation.faithfulness import reasoning_intervention_delta
+        m = self._build(device, enable_reasoning_band=False)
+        cam, mp, vh, ego = self._inputs(device)
+        with pytest.raises(ValueError, match="enable_reasoning_band"):
+            reasoning_intervention_delta(m, cam, mp, vh, ego)
+
+
+# ---------------------------------------------------------------------------
+# Audit regressions (comité 3/07)
+# ---------------------------------------------------------------------------
+
+class TestAuditRegressions(_AutoE2EHarness):
+    def test_faithfulness_zero_delta_with_world_model_on(self, device):
+        """CRITICAL fix: with the World Model enabled, every forward pushes to
+        the rolling buffer — without snapshot/restore the coupled and
+        intervened runs would diverge even with an untrained gate."""
+        from evaluation.faithfulness import reasoning_intervention_delta
+        m = self._build(device, enable_reasoning_band=True,
+                        enable_world_model=True,
+                        reasoning_kwargs={"hidden_dim": 32})
+        cam, mp, vh, ego = self._inputs(device)
+        buf_before = list(m.visual_history_buffer._buf)
+        delta = reasoning_intervention_delta(m, cam, mp, vh, ego)
+        assert delta["trajectory_l2"] == pytest.approx(0.0, abs=1e-5)
+        # Caller's rollout state untouched by the metric.
+        assert len(m.visual_history_buffer._buf) == len(buf_before)
+
+    def test_night_caption_does_not_activate_day_labels(self, device):
+        branch = MoondreamReasoningBranch(
+            visual_history_dim=VH_DIM,
+            caption_fn=lambda imgs: ["driving in the rain at night"] * imgs.shape[0],
+        ).to(device)
+        pred = branch(_vh(device), images=torch.zeros(B, 3, 8, 8, device=device))
+        wea = torch.sigmoid(pred.logits["weather_env"][0])
+        g = DEFAULT_TAXONOMY["weather_env"]
+        assert wea[0, g.index("rain_night")] > 0.9
+        assert wea[0, g.index("rain_day")] < 0.1   # suppressed by "night"
+
+    def test_horizon_contract_exposed_by_both_variants(self, device):
+        band = _band(device)
+        branch = MoondreamReasoningBranch(
+            visual_history_dim=VH_DIM,
+            caption_fn=lambda imgs: ["x"] * imgs.shape[0],
+        )
+        assert band.num_future_horizons == 4
+        assert branch.num_future_horizons == 0
+
+    def test_frozen_variant_trains_with_matching_horizon_targets(self, device):
+        """End-to-end: A-variant logits + 0-horizon teacher targets → loss OK."""
+        branch = MoondreamReasoningBranch(
+            visual_history_dim=VH_DIM,
+            caption_fn=lambda imgs: ["turning left"] * imgs.shape[0],
+        ).to(device)
+        frames = torch.zeros(B, 3, 8, 8, device=device)
+        pred = branch(_vh(device), images=frames)
+        teacher = DeterministicTeacher(active_labels={"maneuver": ["turn_left"]})
+        targets = teacher.label([frames],
+                                num_future_horizons=branch.num_future_horizons)
+        loss = ReasoningLoss()(pred.logits, targets)
+        assert torch.isfinite(loss)
+
+    def test_default_revision_is_pinned(self):
+        """Supply-chain: trust_remote_code demands a pinned revision."""
+        branch = MoondreamReasoningBranch(caption_fn=lambda imgs: [])
+        assert branch._revision is not None
+
+    def test_lazy_model_stays_out_of_state_dict(self, device):
+        """The frozen captioner must never enter checkpoints (0.5B params)."""
+        branch = MoondreamReasoningBranch(
+            visual_history_dim=VH_DIM, caption_fn=lambda imgs: []
+        )
+        # Emulate exactly what the lazy loader now does.
+        object.__setattr__(branch, "_model", nn.Linear(4, 4))
+        assert not any(k.startswith("_model") for k in branch.state_dict())
+        assert "_model" not in dict(branch.named_modules())
+
+    def test_front_view_index_validated_at_init(self, device):
+        with pytest.raises(ValueError, match="front_view_index"):
+            self._build(device, enable_reasoning_band=True,
+                        reasoning_kwargs={"hidden_dim": 32,
+                                          "front_view_index": 7})

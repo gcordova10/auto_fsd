@@ -11,17 +11,30 @@ sys.path.append('..')
 from model_components.auto_e2e import AutoE2E
 
 
-def run_speed_benchmark(backbone, device, batch_size=1, num_views=8):
+def run_speed_benchmark(backbone, device, batch_size=1, num_views=8,
+                        reasoning="off"):
 
     print(f"{'='*80}")
-    print(f"  backbone = '{backbone}' | fusion = 'bev' | batch={batch_size} | views={num_views}")
+    print(f"  backbone = '{backbone}' | fusion = 'bev' | batch={batch_size} "
+          f"| views={num_views} | reasoning = '{reasoning}'")
     print(f"{'='*80}\n")
 
     # Instantiate model. After the Reactive_E2E refactor the only multi-view
     # fusion is BEV (concat / cross_attn and the fusion_mode knob were removed);
     # the BEV grid size is configured via view_fusion_kwargs.
+    #
+    # ``reasoning`` optionally enables the Reasoning band (#98) so its
+    # inference cost is measured explicitly — the reasoning-branch analogue of
+    # what #102 asks for the world-model branch.  Note the band runs at 1 Hz
+    # in deployment (not every 10 Hz reactive tick), so its per-forward cost
+    # here is an upper bound on its real-time budget.
+    extra_kwargs = {}
+    if reasoning != "off":
+        extra_kwargs = dict(enable_reasoning_band=True,
+                            reasoning_kwargs={"backbone": reasoning})
     model = AutoE2E(backbone=backbone, num_views=num_views,
-                    view_fusion_kwargs={"bev_h": 8, "bev_w": 8})
+                    view_fusion_kwargs={"bev_h": 8, "bev_w": 8},
+                    **extra_kwargs)
     model = model.to(device)
     model.eval()
 
@@ -94,6 +107,7 @@ def run_speed_benchmark(backbone, device, batch_size=1, num_views=8):
     results = {
         "backbone": backbone,
         "fusion_mode": "bev",
+        "reasoning_band": reasoning,
         "batch_size": batch_size,
         "num_views": num_views,
         "avg_fps": round(avg_fps, 2),
@@ -168,11 +182,11 @@ def save_results_json(all_results, device, input_resolution=(256, 256)):
 def print_markdown_table(all_results):
     """Print results as a Markdown table for easy pasting into README."""
     print("\n## Benchmark Results\n")
-    print("| Backbone | Fusion Mode | Batch | FPS | Latency (ms) | p99 (ms) | VRAM (MB) | Params |")
-    print("|----------|-------------|-------|-----|--------------|----------|-----------|--------|")
+    print("| Backbone | Fusion Mode | Reasoning | Batch | FPS | Latency (ms) | p99 (ms) | VRAM (MB) | Params |")
+    print("|----------|-------------|-----------|-------|-----|--------------|----------|-----------|--------|")
     for r in all_results:
         params_m = r["total_params"] / 1_000_000
-        print(f"| {r['backbone']} | {r['fusion_mode']} | {r['batch_size']} | "
+        print(f"| {r['backbone']} | {r['fusion_mode']} | {r.get('reasoning_band', 'off')} | {r['batch_size']} | "
               f"{r['avg_fps']:.1f} | {r['avg_latency_ms']:.1f} | {r['p99_latency_ms']:.1f} | "
               f"{r['peak_vram_allocated_mb']:.0f} | {params_m:.1f}M |")
 
@@ -180,6 +194,9 @@ def print_markdown_table(all_results):
 def parse_args():
     parser = argparse.ArgumentParser(description="AutoE2E speed benchmark")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--include-moondream", action="store_true",
+                        help="Also benchmark the frozen Moondream2 reasoning "
+                             "branch (downloads the checkpoint on first run).")
     return parser.parse_args()
 
 
@@ -206,6 +223,21 @@ def main():
             result = run_speed_benchmark(backbone, device, batch_size=batch_size)
             all_results.append(result)
             print()
+
+    # Reasoning band (#98): measure the added cost of the branch explicitly,
+    # on the default backbone at batch 1 (its deployment operating point —
+    # the band runs at 1 Hz).  The frozen Moondream2 variant downloads its
+    # checkpoint, so it is opt-in via --include-moondream.
+    reasoning_variants = ["head_on_896"]
+    if args.include_moondream:
+        reasoning_variants.append("moondream_frozen")
+    for reasoning in reasoning_variants:
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        result = run_speed_benchmark(backbones[0], device, batch_size=1,
+                                     reasoning=reasoning)
+        all_results.append(result)
+        print()
 
     # Save structured results
     save_results_json(all_results, device)
