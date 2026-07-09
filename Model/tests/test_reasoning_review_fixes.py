@@ -68,6 +68,10 @@ class TestConfidenceBrierLoss:
         confidence_brier_loss(logits, target).backward()
         assert logits.grad is not None and torch.isfinite(logits.grad).all()
 
-    def test_taxonomy_is_importable_default(self):
-        # sanity: the default taxonomy still exposes the 3 groups used above.
-        assert DEFAULT_TAXONOMY.group_names == ["maneuver", "edge_case", "weather_env"]
+    def test_taxonomy_exposes_legacy_and_ontology_axes(self):
+        # legacy axes stay first (stable indices); the action-relevant ontology
+        # axes are appended by the decoder migration.
+        names = DEFAULT_TAXONOMY.group_names
+        assert names[:3] == ["maneuver", "edge_case", "weather_env"]
+        for axis in ("cause", "hazard_event", "relation_to_ego", "longitudinal_response"):
+            assert axis in names

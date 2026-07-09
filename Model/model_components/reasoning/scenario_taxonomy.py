@@ -87,6 +87,79 @@ _WEATHER_ENV_LABELS: tuple[str, ...] = (
     "fog_night",
 )
 
+# ---------------------------------------------------------------------------
+# Action-relevant ontology axes (@riita10069's #98 spec §5.3 / §5.4 / §11).
+# These are the planner-relevant "why / relation / response" axes — the value
+# the #98 thread converged on (the *cause* is what the trajectory doesn't
+# already encode). Added append-only alongside the legacy axes; do NOT reorder.
+# ---------------------------------------------------------------------------
+
+_CAUSE_LABELS: tuple[str, ...] = (
+    "lead_vehicle",
+    "cut_in",
+    "cross_traffic",
+    "oncoming_vehicle",
+    "pedestrian_crossing",
+    "vru_conflict",
+    "red_light",
+    "stop_sign",
+    "yield_sign",
+    "human_direction",
+    "route_turn",
+    "route_merge",
+    "lane_ending",
+    "object_blocking_path",
+    "occlusion",
+    "poor_visibility",
+    "slippery_road",
+    "uncertainty_high",
+    "unknown_cause",
+)
+
+_HAZARD_LABELS: tuple[str, ...] = (
+    "collision_risk",
+    "vru_collision_risk",
+    "cut_in_risk",
+    "merge_conflict",
+    "red_light_violation_risk",
+    "right_of_way_violation_risk",
+    "offroad_risk",
+    "occlusion_risk",
+    "low_friction_risk",
+    "unknown_hazard",
+)
+
+_RELATION_TO_EGO_LABELS: tuple[str, ...] = (
+    "same_lane_ahead",
+    "adjacent",
+    "crossing_path",
+    "about_to_cross_path",
+    "merging_into_ego_path",
+    "cutting_into_ego_path",
+    "oncoming_conflict",
+    "blocking_current_lane",
+    "blocking_target_lane",
+    "blocking_route",
+    "intersection_conflict",
+    "occluded_near_path",
+    "unknown_relation",
+)
+
+_LONGITUDINAL_RESPONSE_LABELS: tuple[str, ...] = (
+    "keep_speed",
+    "accelerate",
+    "coast",
+    "slow_down",
+    "prepare_stop",
+    "stop",
+    "stay_stopped",
+    "creep",
+    "yield",
+    "follow_lead_vehicle",
+    "increase_gap",
+    "emergency_brake",
+)
+
 
 class ScenarioTaxonomy:
     """Registry of scenario label groups.
@@ -110,11 +183,25 @@ class ScenarioTaxonomy:
     def __init__(self) -> None:
         self._groups: Dict[str, TaxonomyGroup] = {}
 
-        # Register the three canonical axes in a fixed order so that
-        # ``groups`` always starts with {maneuver, edge_case, weather_env}.
+        # Legacy placeholder axes (kept first so their indices never move).
+        # maneuver is the "action" label the #98 thread found least additive
+        # (the trajectory already encodes it) and weather_env is not
+        # action-relevant; both stay for back-compat and will be deprecated
+        # once the ontology axes below are trained.
         self.register_group("maneuver", list(_MANEUVER_LABELS))
         self.register_group("edge_case", list(_EDGE_CASE_LABELS))
         self.register_group("weather_env", list(_WEATHER_ENV_LABELS))
+
+        # Action-relevant ontology axes (@riita10069's #98 spec) — the
+        # planner-relevant "why / relation / response" the design converged on.
+        # Migrated append-only: the band, loss and teachers all iterate
+        # ``groups`` so they pick these up automatically with no interface change.
+        self.register_group("cause", list(_CAUSE_LABELS))
+        self.register_group("hazard_event", list(_HAZARD_LABELS))
+        self.register_group("relation_to_ego", list(_RELATION_TO_EGO_LABELS))
+        self.register_group(
+            "longitudinal_response", list(_LONGITUDINAL_RESPONSE_LABELS)
+        )
 
     # ------------------------------------------------------------------
     # Extension API

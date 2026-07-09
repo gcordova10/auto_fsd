@@ -129,6 +129,10 @@ class AutoE2E(nn.Module):
             visual_history = wam.aggregate_history(
                 self.visual_history_buffer.visual_history())  # type: ignore[union-attr]
             if mode == "train":
+                # JEPA target is computed here, BEFORE the reasoning band
+                # overwrites ``visual_history`` below, so the world-model
+                # self-supervision sees the UNMODULATED history — its future
+                # target never chases the reasoning-conditioned signal (#108).
                 future_state_pred = wam.predict_future(visual_history)
 
         # Reasoning Band (1Hz): classify the current scenario (and, in training,
