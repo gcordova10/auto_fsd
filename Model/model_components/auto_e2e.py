@@ -21,6 +21,11 @@ class AutoE2E(nn.Module):
                  reasoning_kwargs: Optional[Dict[str, Any]] = None):
         super(AutoE2E, self).__init__()
 
+        # The reasoning band's latent dimension (its hidden_dim) must match the
+        # reason_proj the reactive model uses for the §8 coupling, so thread it
+        # through even when the band is disabled (reason_proj then stays unused).
+        reasoning_latent_dim = (reasoning_kwargs or {}).get("hidden_dim", 256)
+
         # Reactive model which runs at 10Hz and processes multi-camera inputs
         # a rendered map image and egomotion history to predict a driving trajectory
         # to reach the near-horizon navigational goal
@@ -32,7 +37,9 @@ class AutoE2E(nn.Module):
                  map_type=map_type, map_in_channels=map_in_channels,
                  map_fusion_mode=map_fusion_mode, map_fusion_kwargs=map_fusion_kwargs,
                  temporal_memory_mode=temporal_memory_mode, temporal_memory_kwargs=temporal_memory_kwargs,
-                 planner_mode=planner_mode, planner_kwargs=planner_kwargs)
+                 planner_mode=planner_mode, planner_kwargs=planner_kwargs,
+                 reasoning_latent_dim=reasoning_latent_dim,
+                 enable_reasoning_coupling=enable_reasoning_band)
 
         # World Action Model (slow, ~1Hz): encodes the multi-camera history into
         # the Encoded Visual History (fed to the reactive planner) and predicts
@@ -54,11 +61,11 @@ class AutoE2E(nn.Module):
 
         # Reasoning Band (slow, ~1Hz): classifies the current (and in training,
         # future) scenario across multi-label taxonomy groups, supervised by
-        # the student/teacher loss, and feeds the trajectory planner through a
-        # ZERO-INIT gate that modulates the visual history (#98/#103) — a
-        # strict no-op at initialisation, so with the gate untrained the
-        # reactive baseline is unchanged.  Opt-in (default OFF) so the
-        # reactive-only baseline is byte-for-byte unchanged when disabled.
+        # the student/teacher loss, and emits a reasoning_latent that feeds the
+        # trajectory planner through Reactive_E2E's ZERO-INIT residual (§8,
+        # #98/#103) — a strict no-op at initialisation, so with the coupling
+        # untrained the reactive baseline is unchanged.  Opt-in (default OFF) so
+        # the reactive-only baseline is byte-for-byte unchanged when disabled.
         self.Reasoning_Band: Optional[nn.Module] = None
         if enable_reasoning_band:
             from .reasoning.reasoning_band import ReasoningBand  # local import — lazy
@@ -136,17 +143,19 @@ class AutoE2E(nn.Module):
                 future_state_pred = wam.predict_future(visual_history)
 
         # Reasoning Band (1Hz): classify the current scenario (and, in training,
-        # future horizons), then condition the planner through the band's
-        # zero-init gate: the planner receives the MODULATED visual history,
-        # which at initialisation is identical to the input (strict no-op) and
-        # only diverges as training moves the gate (#98/#103).
+        # future horizons) and produce a reasoning_latent that conditions the
+        # planner through a zero-init residual inside Reactive_E2E (§8): at
+        # initialisation the residual is a strict no-op (alpha=0), so the reactive
+        # baseline is unchanged and only diverges as training moves it (#98/#103).
         reasoning_pred = None
+        reasoning_latent = None
         if self.Reasoning_Band is not None:
             reasoning_pred = self.Reasoning_Band(visual_history, mode=mode)
-            visual_history = reasoning_pred.modulated_visual_history
+            reasoning_latent = reasoning_pred.reasoning_latent
 
         trajectory = self.Reactive_E2E(camera_tiles, map_input, visual_history, egomotion_history,
         projection=projection, geometry_type=geometry_type, image_transform=image_transform,
+        reasoning_latent=reasoning_latent,
         mode=mode, trajectory_target=trajectory_target, **kwargs)
 
         # Return contract:

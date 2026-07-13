@@ -160,6 +160,43 @@ _LONGITUDINAL_RESPONSE_LABELS: tuple[str, ...] = (
     "emergency_brake",
 )
 
+# response is split into longitudinal / lateral / tactical / rule (riita #98
+# §5.4), because a single "response" class is too ambiguous (a "slow_down" can be
+# a lead vehicle, a red light, or a route turn). Labels are riita's §12 / §5.4.
+_LATERAL_RESPONSE_LABELS: tuple[str, ...] = (
+    "keep_lane",
+    "nudge_left",
+    "nudge_right",
+    "lane_change_left",
+    "lane_change_right",
+    "avoid_left",
+    "avoid_right",
+    "return_to_lane",
+    "pull_over",
+    "reverse",
+)
+
+_TACTICAL_RESPONSE_LABELS: tuple[str, ...] = (
+    "proceed",
+    "proceed_with_caution",
+    "wait_for_gap",
+    "wait_for_actor",
+    "wait_for_signal",
+    "creep_for_visibility",
+    "negotiate_merge",
+    "negotiate_unprotected_turn",
+    "reroute_or_wait",
+)
+
+_RULE_RESPONSE_LABELS: tuple[str, ...] = (
+    "wait_for_green",
+    "stop_at_stop_line",
+    "yield_to_vru",
+    "yield_to_oncoming",
+    "obey_human_direction",
+    "respect_speed_limit",
+)
+
 
 class ScenarioTaxonomy:
     """Registry of scenario label groups.
@@ -199,6 +236,9 @@ class ScenarioTaxonomy:
         self.register_group("cause", list(_CAUSE_LABELS))
         self.register_group("hazard_event", list(_HAZARD_LABELS))
         self.register_group("relation_to_ego", list(_RELATION_TO_EGO_LABELS))
+        self.register_group("lateral_response", list(_LATERAL_RESPONSE_LABELS))
+        self.register_group("tactical_response", list(_TACTICAL_RESPONSE_LABELS))
+        self.register_group("rule_response", list(_RULE_RESPONSE_LABELS))
         self.register_group(
             "longitudinal_response", list(_LONGITUDINAL_RESPONSE_LABELS)
         )

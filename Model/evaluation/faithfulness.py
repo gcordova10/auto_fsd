@@ -7,10 +7,10 @@ This module measures the opposite, causal notion directly in our stack: run
 the same batch **with and without the reasoning band's planner coupling** and
 report how much the trajectory actually moves.
 
-Because the band's gate is zero-initialised (no-op), the delta is exactly 0.0
-at initialisation and only becomes positive once training pushes the gate away
-from zero — so this doubles as a regression check that enabling the band does
-not perturb the reactive baseline before training.
+Because the §8 reasoning residual is zero-initialised (alpha=0, no-op), the
+delta is exactly 0.0 at initialisation and only becomes positive once training
+pushes the coupling away from zero — so this doubles as a regression check that
+enabling the band does not perturb the reactive baseline before training.
 """
 
 from __future__ import annotations
@@ -47,11 +47,11 @@ def reasoning_intervention_delta(
     Returns:
         dict with:
         * ``trajectory_l2``: mean L2 distance between the coupled and
-          intervened trajectories (0.0 while the gate is untrained).
-        * ``history_shift``: mean L2 between the modulated and the **effective**
-          visual history the band actually receives inside the model (with the
-          World Model on, that is the WAM-aggregated history, not the raw
-          caller input) — how hard the gate is steering the planner input.
+          intervened trajectories (0.0 while the coupling is untrained).
+        * ``coupling_shift``: mean L2 norm of the §8 reasoning residual
+          ``alpha * reason_proj(reasoning_latent)`` that Reactive_E2E adds to the
+          planner's visual context — how hard the reasoning is steering the
+          planner (0.0 at init, since alpha starts at zero).
 
     Raises:
         ValueError: if the model has no reasoning band to intervene on.
@@ -84,15 +84,12 @@ def reasoning_intervention_delta(
         mode="infer",
     )
 
-    # Capture the EFFECTIVE visual history the band receives inside the model.
-    # With the World Model enabled, AutoE2E replaces the caller's
-    # ``visual_history`` with the WAM-aggregated history before the band runs;
-    # measuring history_shift against the raw caller input would be wrong.
+    # Capture the reasoning latent the band emits, so we can measure the §8
+    # residual Reactive_E2E adds to the planner's visual context.
     captured: dict[str, torch.Tensor] = {}
 
     def _hook(_module: torch.nn.Module, inputs: Any, output: Any) -> None:
-        captured["effective"] = inputs[0].detach()
-        captured["modulated"] = output.modulated_visual_history.detach()
+        captured["reasoning_latent"] = output.reasoning_latent.detach()
 
     handle = band.register_forward_hook(_hook)
     try:
@@ -121,10 +118,10 @@ def reasoning_intervention_delta(
         if was_training:
             model.train()
 
-    if "modulated" not in captured:
+    if "reasoning_latent" not in captured:
         raise RuntimeError(
             "the reasoning band did not run during the coupled forward; "
-            "cannot compute history_shift."
+            "cannot compute coupling_shift."
         )
 
     coupled_traj = coupled[0] if isinstance(coupled, tuple) else coupled
@@ -133,11 +130,17 @@ def reasoning_intervention_delta(
     trajectory_l2 = torch.linalg.vector_norm(
         coupled_traj - intervened_traj, dim=-1
     ).mean()
-    history_shift = torch.linalg.vector_norm(
-        captured["modulated"] - captured["effective"], dim=-1
-    ).mean()
+
+    # The §8 residual Reactive_E2E adds to the planner's visual context:
+    # alpha * reason_proj(reasoning_latent).  Zero at init (alpha starts at 0).
+    reactive: Any = model.Reactive_E2E
+    with torch.no_grad():
+        residual = reactive.reason_alpha * reactive.reason_proj(
+            captured["reasoning_latent"]
+        )
+    coupling_shift = torch.linalg.vector_norm(residual, dim=-1).mean()
 
     return {
         "trajectory_l2": float(trajectory_l2),
-        "history_shift": float(history_shift),
+        "coupling_shift": float(coupling_shift),
     }

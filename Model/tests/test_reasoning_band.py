@@ -179,11 +179,12 @@ class TestReasoningBandShapes:
 # Zero-init gate (planner coupling, #98/#103) + per-horizon confidence
 # ---------------------------------------------------------------------------
 
-class TestZeroInitGateAndConfidence:
-    """The band feeds the planner through a zero-init gate: at initialisation
-    the modulated visual history is IDENTICAL to the input (strict no-op), so
-    enabling the band leaves the reactive baseline unchanged until training
-    moves the gate.  A per-horizon confidence accompanies the logits (#103)."""
+class TestPredictionAndConfidence:
+    """The band emits a typed prediction with a planner-facing reasoning_latent
+    and a per-horizon confidence (#103).  The zero-init planner coupling (§8)
+    now lives in Reactive_E2E, so its no-op-at-init behaviour is exercised by
+    the AutoE2E integration tests below (byte-identical baseline) and by the
+    faithfulness tests, not on the band in isolation."""
 
     def test_returns_typed_prediction(self, device):
         band = _band(device)
@@ -191,22 +192,11 @@ class TestZeroInitGateAndConfidence:
         assert isinstance(pred, ReasoningPrediction)
         assert set(pred.logits.keys()) == set(DEFAULT_TAXONOMY.group_names)
 
-    def test_gate_is_noop_at_init(self, device):
-        band = _band(device)
+    def test_reasoning_latent_shape(self, device):
+        band = _band(device)  # _band builds with hidden_dim=64
         vh = _vh(device)
-        for mode in ("infer", "train"):
-            pred = band(vh, mode=mode)
-            assert torch.allclose(pred.modulated_visual_history, vh, atol=1e-6), (
-                "Zero-init gate must be a strict no-op at initialisation."
-            )
-
-    def test_gate_diverges_once_trained(self, device):
-        band = _band(device)
-        vh = _vh(device)
-        with torch.no_grad():
-            band.gate.beta.bias.fill_(0.5)
-        pred = band(vh, mode="infer")
-        assert not torch.allclose(pred.modulated_visual_history, vh)
+        assert band(vh, mode="train").reasoning_latent.shape == (B, 64)
+        assert band(vh, mode="infer").reasoning_latent.shape == (B, 64)
 
     def test_visual_history_not_mutated_in_place(self, device):
         band = _band(device)
@@ -221,11 +211,11 @@ class TestZeroInitGateAndConfidence:
         assert band(vh, mode="train").confidence.shape == (B, 5)
         assert band(vh, mode="infer").confidence.shape == (B, 1)
 
-    def test_gate_receives_gradient(self, device):
+    def test_latent_receives_gradient(self, device):
         band = _band(device)
         pred = band(_vh(device), mode="train")
-        pred.modulated_visual_history.sum().backward()
-        assert band.gate.gamma.weight.grad is not None
+        pred.reasoning_latent.sum().backward()
+        assert band.horizon_queries.grad is not None
 
 
 # ---------------------------------------------------------------------------
@@ -598,17 +588,18 @@ class TestReasoningInterventionDelta(_AutoE2EHarness):
         cam, mp, vh, ego = self._inputs(device)
         delta = reasoning_intervention_delta(m, cam, mp, vh, ego)
         assert delta["trajectory_l2"] == pytest.approx(0.0, abs=1e-5)
-        assert delta["history_shift"] == pytest.approx(0.0, abs=1e-5)
+        assert delta["coupling_shift"] == pytest.approx(0.0, abs=1e-5)
 
-    def test_positive_delta_once_gate_moves(self, device):
+    def test_positive_delta_once_coupling_moves(self, device):
         from evaluation.faithfulness import reasoning_intervention_delta
         m = self._build(device, enable_reasoning_band=True,
                         reasoning_kwargs={"hidden_dim": 32})
+        # Move the §8 residual scale off zero (it lives in Reactive_E2E now).
         with torch.no_grad():
-            m.Reasoning_Band.gate.beta.bias.fill_(1.0)
+            m.Reactive_E2E.reason_alpha.fill_(1.0)
         cam, mp, vh, ego = self._inputs(device)
         delta = reasoning_intervention_delta(m, cam, mp, vh, ego)
-        assert delta["history_shift"] > 0.0
+        assert delta["coupling_shift"] > 0.0
 
     def test_band_restored_after_intervention(self, device):
         from evaluation.faithfulness import reasoning_intervention_delta

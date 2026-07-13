@@ -1,3 +1,4 @@
+import torch
 import torch.nn as nn
 from .backbone import Backbone
 from .feature_fusion import FeatureFusion
@@ -16,7 +17,8 @@ class ReactiveE2E(nn.Module):
                  map_type="rasterized", map_in_channels=3,
                  map_fusion_mode="residual", map_fusion_kwargs=None,
                  temporal_memory_mode="no_memory", temporal_memory_kwargs=None,
-                 planner_mode="gru", planner_kwargs=None):
+                 planner_mode="gru", planner_kwargs=None,
+                 reasoning_latent_dim=256, enable_reasoning_coupling=False):
         super(ReactiveE2E, self).__init__()
 
         # Camera backbone feature extractor
@@ -74,11 +76,26 @@ class ReactiveE2E(nn.Module):
             **(planner_kwargs or {}),
         )
 
+        # Reasoning-band coupling (@riita10069 #98 §8): a zero-init residual
+        # injects the reasoning latent into the planner's visual context.
+        # ``reason_alpha`` starts at 0, so the reactive baseline is byte-identical
+        # until training moves it — the same no-op guarantee as #108's gate, but
+        # applied at the planner-conditioning seam (§8) instead of by modulating
+        # the visual history.  Planner-agnostic: every planner reads visual_ctx.
+        # Built only when a reasoning band will feed it, so the reactive-only
+        # default has no unused parameters.
+        self.reason_proj: nn.Linear | None = None
+        self.reason_alpha: nn.Parameter | None = None
+        if enable_reasoning_coupling:
+            self.reason_proj = nn.Linear(reasoning_latent_dim, visual_history_dim)
+            self.reason_alpha = nn.Parameter(torch.zeros(1))
+
         # Future visual state prediction conditioned on planner ego_hidden
         self.FutureState = FutureState(embed_dim=embed_dim, ego_hidden_dim=embed_dim)
 
     def forward(self, camera_tiles, map_input, visual_history, egomotion_history,
-                projection=None, geometry_type=None, image_transform=None, **kwargs):
+                projection=None, geometry_type=None, image_transform=None,
+                reasoning_latent=None, **kwargs):
         """
         Run the reactive end-to-end autonomous-driving pipeline.
 
@@ -118,6 +135,10 @@ class ReactiveE2E(nn.Module):
 
         # --- Temporal Memory ---
         visual_ctx, ego_ctx = self.TemporalMemory(visual_history, egomotion_history)
+
+        # --- Reasoning coupling (§8): zero-init residual into the planner context ---
+        if reasoning_latent is not None and self.reason_proj is not None:
+            visual_ctx = visual_ctx + self.reason_alpha * self.reason_proj(reasoning_latent)
 
         # --- Trajectory Prediction ---
         trajectory = self.TrajectoryPlanner(
