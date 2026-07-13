@@ -31,7 +31,7 @@ Offline only, like every other teacher: it never runs inside the training loop.
 from __future__ import annotations
 
 from collections import Counter
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .schema import (
     NUM_HORIZONS,
@@ -39,7 +39,7 @@ from .schema import (
     ReasoningHorizonLabel,
     ReasoningLabelRecord,
 )
-from .teacher_client import TeacherClient, TeacherRequest
+from .teacher_client import TeacherClient, TeacherRequest, register_teacher
 
 # Which core groups hold a list of active labels, and which hold exactly one.
 _MULTI_LABEL_GROUPS: Tuple[str, ...] = ("hazard_event", "cause")
@@ -207,3 +207,44 @@ def _same_label_space(a: object, b: object) -> bool:
     except AttributeError:
         return False
     return groups_a == groups_b
+
+
+def build_multi_teacher(
+    members: Sequence[Dict[str, Any]],
+    *,
+    min_agreement: float = 0.5,
+    **kwargs: Any,
+) -> "MultiTeacher":
+    """Factory for the ``build_teacher("multi_teacher", ...)`` registry entry.
+
+    Without this the class is unreachable: a run selects its teacher by a config
+    STRING (``teacher_provider``), and ``parallel_label.init_worker`` calls
+    ``build_teacher(teacher, **teacher_kwargs)``. A backend that is not in the
+    registry cannot be selected by any pipeline, however good it is.
+
+    ``members`` is a list of per-teacher configs, each carrying the ``provider``
+    key the registry keys on plus that backend's own kwargs. Nesting configs
+    rather than pre-built clients keeps the whole teacher choice expressible in a
+    Flyte task's string/JSON parameters, which is how every other backend is
+    selected today:
+
+        build_teacher("multi_teacher", members=[
+            {"provider": "openai_compatible", "base_url": "...", "model": "qwen"},
+            {"provider": "openai_compatible", "base_url": "...", "model": "gemma"},
+        ], min_agreement=0.5)
+    """
+    from .teacher_client import build_teacher
+
+    built = []
+    for m in members:
+        cfg = dict(m)
+        provider = cfg.pop("provider", None)
+        if not provider:
+            raise ValueError(f"each member needs a 'provider' key; got {m!r}")
+        if provider == "multi_teacher":
+            raise ValueError("a MultiTeacher cannot be its own member")
+        built.append(build_teacher(provider, **cfg))
+    return MultiTeacher(built, min_agreement=min_agreement, **kwargs)
+
+
+register_teacher("multi_teacher", build_multi_teacher)

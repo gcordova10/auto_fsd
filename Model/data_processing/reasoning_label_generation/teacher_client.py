@@ -134,7 +134,9 @@ def build_teacher(provider: str, **kwargs: Any) -> TeacherClient:
     Backends register lazily on import; this imports the known modules so the
     registry is populated before lookup.
     """
-    from . import cached_teacher, mock_teacher, openai_compatible  # noqa: F401
+    from . import (  # noqa: F401
+        cached_teacher, mock_teacher, multi_teacher, openai_compatible,
+    )
 
     if provider not in _TEACHER_FACTORIES:
         raise ValueError(

@@ -175,3 +175,41 @@ def test_all_five_horizons_are_produced():
     labels = {"cause": ["red_light"]}
     mt = MultiTeacher([FakeTeacher("a", labels), FakeTeacher("b", labels)])
     assert len(mt.label(_req()).horizons) == NUM_HORIZONS
+
+
+# --- El registro: lo que hace que MultiTeacher sea ALCANZABLE ---------------
+# Sin esto la clase es código muerto: un run elige su teacher por una CADENA de
+# config (teacher_provider), y parallel_label.init_worker llama a
+# build_teacher(teacher, **teacher_kwargs). Un backend que no está en el registro
+# no lo puede seleccionar ningún pipeline, por bueno que sea.
+
+def test_multi_teacher_is_selectable_by_config_string():
+    from data_processing.reasoning_label_generation.teacher_client import build_teacher
+
+    t = build_teacher(
+        "multi_teacher",
+        members=[
+            {"provider": "mock", "model": "mock-a"},
+            {"provider": "mock", "model": "mock-b"},
+        ],
+        min_agreement=0.5,
+    )
+    assert t.provider == "multi_teacher"
+    assert len(t.teachers) == 2
+
+
+def test_multi_teacher_rejects_a_member_without_a_provider():
+    from data_processing.reasoning_label_generation.teacher_client import build_teacher
+
+    with pytest.raises(ValueError, match="provider"):
+        build_teacher("multi_teacher", members=[{"model": "a"}, {"provider": "mock"}])
+
+
+def test_multi_teacher_cannot_nest_itself():
+    from data_processing.reasoning_label_generation.teacher_client import build_teacher
+
+    with pytest.raises(ValueError, match="its own member"):
+        build_teacher(
+            "multi_teacher",
+            members=[{"provider": "multi_teacher"}, {"provider": "mock"}],
+        )
