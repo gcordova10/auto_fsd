@@ -1017,12 +1017,18 @@ def train_il(
     # is no longer a constructor arg, so it lives only in metadata below. The
     # branch flags MUST be recorded so a later stage (offline RL / eval) rebuilds
     # the SAME architecture — otherwise load_state_dict fails on missing keys.
+    #
+    # reasoning_kwargs is part of that architecture, not a training detail: it is
+    # what adds the BEV tokenizer to the head. Leaving it out is exactly the failure
+    # the paragraph above warns about — a BEV-context run trains for hours and then
+    # the eval dies with "Unexpected key(s) in state_dict: ...bev_tokenizer...".
     torch.save({
         "model_state_dict": model.state_dict(),
         "config": {
             "backbone": bb, "embed_dim": 256, "num_views": num_views,
             "enable_reasoning": enable_reasoning, "reasoning_mode": reasoning_mode,
             "enable_world_model": enable_world_model,
+            "reasoning_kwargs": reasoning_kwargs,
         },
         "epoch": epochs,
     }, ckpt_path)
