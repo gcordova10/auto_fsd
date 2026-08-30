@@ -77,8 +77,12 @@ class FusionProbe:
         self._handles = [
             view_fusion.output_proj.register_forward_hook(keep_input("pre_residual")),
             view_fusion.register_forward_hook(keep("image_bev")),
-            r.FusedFeaturePooling.register_forward_hook(keep("planner_input")),
         ]
+        # The flow-matching planner consumes the full BEV grid and has no
+        # FusedFeaturePooling; planner_input is then reported as nan.
+        if getattr(r, "FusedFeaturePooling", None) is not None:
+            self._handles.append(
+                r.FusedFeaturePooling.register_forward_hook(keep("planner_input")))
 
     def remove(self) -> None:
         for handle in self._handles:
@@ -115,6 +119,9 @@ def scene_invariance(model: torch.nn.Module, samples: list[tuple[dict[str, Any],
     for i in range(0, len(samples) - 1, 2):
         caps = [_run_sample(model, *samples[j]) for j in (i, i + 1)]
         for p in POINTS:
+            if p not in caps[0] or p not in caps[1]:
+                acc[p].append(float("nan"))
+                continue
             mask = (caps[0][p] != 0) & (caps[1][p] != 0)
             acc[p].append(relative_distance(caps[0][p], caps[1][p], mask))
     return {p: float(torch.tensor(v).nanmean()) if v else float("nan")
